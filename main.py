@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import html
 import random
 import asyncio
@@ -11,7 +12,7 @@ import httpx
 from PIL import Image as PILImage
 from bs4 import BeautifulSoup
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 import astrbot.api.message_components as Comp
@@ -19,6 +20,17 @@ import astrbot.api.message_components as Comp
 # --- 配置 ---
 LINK_API_ENDPOINT = "https://whatslink.info/api/v1/link"
 CILISOU_BASE_URL = "https://cilisousuo.com"
+
+# 图片安全限制
+MAX_IMAGE_RESPONSE_SIZE = 20 * 1024 * 1024  # 单张图片最大 20MB
+MAX_IMAGE_PIXELS = 8192 * 8192              # 最大像素数（约 67MP）
+DOWNLOAD_CONCURRENCY = 5                     # 截图并发下载数
+
+# 提前配置 PIL 像素上限，防止解压炸弹
+PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+# 磁力链接正则（匹配消息中任意位置）
+MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:[a-zA-Z0-9]+:[a-zA-Z0-9]+")
 CILISOU_HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -34,10 +46,22 @@ class LinkViewPlugin(Star):
         self.config = config
         # 临时图片存放目录
         self.temp_dir = os.path.join(tempfile.gettempdir(), "linkview_images")
+        # 共享 HTTP 客户端（连接复用，避免重复 TLS 握手）
+        self._http_client: Optional[httpx.AsyncClient] = None
+        # 并发下载信号量（限制同时下载的截图数量）
+        self._download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """获取或创建共享的 HTTP 客户端"""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=20.0)
+        return self._http_client
 
     async def initialize(self):
         """插件初始化，创建临时目录"""
         os.makedirs(self.temp_dir, exist_ok=True)
+        # 预创建共享 HTTP 客户端
+        self._http_client = httpx.AsyncClient(timeout=20.0)
         # 日志输出当前配置
         enabled = self.config.get("enable", False)
         whitelist = self.config.get("group_whitelist", [])
@@ -73,33 +97,51 @@ class LinkViewPlugin(Star):
     # ========================
 
     async def add_noise_to_image(self, image_url: str) -> Optional[str]:
-        """下载图片并添加随机像素噪点，返回临时文件路径"""
-        try:
-            async with httpx.AsyncClient() as client:
+        """下载图片并添加随机像素噪点，返回临时文件路径。
+
+        安全措施：
+        - 使用 Semaphore 限制并发下载数
+        - 校验 Content-Type 和响应体大小
+        - PIL 已全局配置像素上限（MAX_IMAGE_PIXELS）
+        """
+        async with self._download_semaphore:
+            try:
+                client = await self._get_http_client()
                 resp = await client.get(image_url, timeout=20.0)
                 resp.raise_for_status()
 
-            image = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
-            width, height = image.size
+                # 校验 Content-Type
+                content_type = resp.headers.get("content-type", "")
+                if not content_type.startswith("image/"):
+                    logger.warning(f"图片 {image_url} Content-Type 非图片类型: {content_type}")
+                    return None
 
-            # 添加 5 个随机噪点
-            for _ in range(5):
-                rand_x = random.randint(0, width - 1)
-                rand_y = random.randint(0, height - 1)
-                rand_color = (
-                    random.randint(0, 255),
-                    random.randint(0, 255),
-                    random.randint(0, 255),
-                )
-                image.putpixel((rand_x, rand_y), rand_color)
+                # 校验响应体大小
+                if len(resp.content) > MAX_IMAGE_RESPONSE_SIZE:
+                    logger.warning(f"图片 {image_url} 体积超限: {len(resp.content)} bytes")
+                    return None
 
-            # 保存到临时文件
-            temp_path = os.path.join(self.temp_dir, f"img_{random.randint(100000, 999999)}.png")
-            image.save(temp_path, format="PNG")
-            return temp_path
-        except Exception as e:
-            logger.warning(f"处理图片 {image_url} 时失败: {e}")
-            return None
+                image = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+                width, height = image.size
+
+                # 添加 5 个随机噪点
+                for _ in range(5):
+                    rand_x = random.randint(0, width - 1)
+                    rand_y = random.randint(0, height - 1)
+                    rand_color = (
+                        random.randint(0, 255),
+                        random.randint(0, 255),
+                        random.randint(0, 255),
+                    )
+                    image.putpixel((rand_x, rand_y), rand_color)
+
+                # 保存到临时文件
+                temp_path = os.path.join(self.temp_dir, f"img_{random.randint(100000, 999999)}.png")
+                image.save(temp_path, format="PNG")
+                return temp_path
+            except Exception as e:
+                logger.warning(f"处理图片 {image_url} 时失败: {e}")
+                return None
 
     @staticmethod
     async def get_magnet_from_cilisou(search_query: str) -> Optional[str]:
@@ -217,7 +259,11 @@ class LinkViewPlugin(Star):
 
         # 获取 bot 名称，用于合并转发消息的显示
         bot_name = self.config.get("forward_bot_name", "LinkView")
-        bot_uin = int(self.config.get("forward_bot_uin", 0))
+        try:
+            bot_uin = int(self.config.get("forward_bot_uin", 0))
+        except (ValueError, TypeError):
+            logger.warning("forward_bot_uin 配置值无效，已回退为 0")
+            bot_uin = 0
         use_forward = self.config.get("use_forward_message", True)
 
         if use_forward and event.get_group_id():
@@ -297,32 +343,43 @@ class LinkViewPlugin(Star):
 
         # 解析找到的磁力链接
         chain, summary, temp_files = await self._do_parse(event, magnet_link)
-        if chain:
-            # 用 chain_result 一次性发送所有 Node（合并转发为一条消息）
-            yield event.chain_result(chain)
+        try:
+            if chain:
+                yield event.chain_result(chain)
+            yield event.plain_result(summary)
+        finally:
             self._cleanup_temp_files(temp_files)
-        yield event.plain_result(summary)
 
-    @filter.regex(r"^magnet:\?xt=urn:[a-zA-Z0-9]+:[a-zA-Z0-9]+")
+    @filter.regex(r"magnet:\?xt=urn:[a-zA-Z0-9]+:[a-zA-Z0-9]+")
     async def magnet_auto_parse(self, event: AstrMessageEvent):
-        """自动检测并解析消息中的磁力链接"""
+        """自动检测并解析消息中的磁力链接（支持消息任意位置）"""
         if not self._is_allowed(event):
             return  # 静默忽略，不响应
         
-        magnet_url = event.message_str.strip()
+        # 从消息中提取磁力链接（支持任意位置匹配）
+        match = MAGNET_PATTERN.search(event.message_str)
+        if not match:
+            return
+        magnet_url = match.group(0).strip()
         logger.info(f"检测到磁力链接: {magnet_url[:60]}...")
 
         yield event.plain_result("收到，正在自动解析磁力链接...")
 
         chain, summary, temp_files = await self._do_parse(event, magnet_url)
-        if chain:
-            # 用 chain_result 一次性发送所有 Node（合并转发为一条消息）
-            yield event.chain_result(chain)
+        try:
+            if chain:
+                yield event.chain_result(chain)
+            yield event.plain_result(summary)
+        finally:
             self._cleanup_temp_files(temp_files)
-        yield event.plain_result(summary)
 
     async def terminate(self):
-        """插件销毁，清理临时目录"""
+        """插件销毁，关闭 HTTP 客户端并清理临时目录"""
+        # 关闭共享 HTTP 客户端
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
+        # 清理临时图片目录
         import shutil
         try:
             if os.path.exists(self.temp_dir):
