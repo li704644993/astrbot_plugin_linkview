@@ -2,5 +2,5 @@ name: astrbot_plugin_linkview
 display_name: LinkView 磁力链接解析
 desc: 磁力链接自动解析与种子搜索插件，支持 whatslink API 解析、截图预览、图片加噪、关键词搜索等功能。
 version: v1.0.0
-author: liting
-repo: https://github.com/your/astrbot_plugin_linkview
+author: leon
+repo: https://github.com/li704644993/astrbot_plugin_linkview
