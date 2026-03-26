@@ -1,6 +1,6 @@
-name: helloworld # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: helloworld # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: AstrBot 插件示例。 # 插件简短描述
-version: v1.3.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Soulter # 作者
-repo: https://github.com/Soulter/helloworld # 插件的仓库地址
+name: astrbot_plugin_linkview
+display_name: LinkView 磁力链接解析
+desc: 磁力链接自动解析与种子搜索插件，支持 whatslink API 解析、截图预览、图片加噪、关键词搜索等功能。
+version: v1.0.0
+author: liting
+repo: https://github.com/your/astrbot_plugin_linkview
