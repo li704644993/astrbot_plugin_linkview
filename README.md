@@ -35,7 +35,7 @@
 
 ```bash
 cd /path/to/astrbot/data/plugins
-git clone https://github.com/your/astrbot_plugin_linkview.git
+git clone https://github.com/li704644993/astrbot_plugin_linkview.git
 ```
 
 重启 AstrBot 即可自动加载。
