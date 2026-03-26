@@ -1,0 +1,32 @@
+{
+  "enable": {
+    "description": "是否启用磁力链接解析功能",
+    "type": "bool",
+    "hint": "全局开关，关闭后插件不会响应任何指令和自动解析",
+    "default": false
+  },
+  "group_whitelist": {
+    "description": "允许使用的群组 ID 白名单",
+    "type": "list",
+    "hint": "填入允许使用此插件的群号列表，如 [\"123456789\", \"987654321\"]。留空表示不限制（所有群和私聊都可用）",
+    "default": []
+  },
+  "use_forward_message": {
+    "description": "群聊中是否使用合并转发消息发送截图",
+    "type": "bool",
+    "hint": "开启后截图将以合并转发的形式发送（需要 OneBot v11 协议支持，如 NapCat）。关闭则直接发送图片",
+    "default": true
+  },
+  "forward_bot_name": {
+    "description": "合并转发消息中显示的 Bot 名称",
+    "type": "string",
+    "hint": "合并转发消息卡片中每条消息显示的发送者名称",
+    "default": "LinkView"
+  },
+  "forward_bot_uin": {
+    "description": "合并转发消息中显示的 Bot QQ 号",
+    "type": "int",
+    "hint": "合并转发消息卡片中每条消息显示的发送者 QQ 号，填 0 则使用默认",
+    "default": 0
+  }
+}

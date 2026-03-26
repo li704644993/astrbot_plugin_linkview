@@ -4,7 +4,7 @@ import html
 import random
 import asyncio
 import tempfile
-from typing import Optional
+from typing import Optional, Tuple, List
 from urllib.parse import quote, urljoin
 
 import httpx
@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 import astrbot.api.message_components as Comp
 
 # --- 配置 ---
@@ -29,15 +29,44 @@ CILISOU_HEADERS = {
 
 @register("linkview", "liting", "磁力链接解析与种子搜索插件", "1.0.0", "https://github.com/your/repo")
 class LinkViewPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
         # 临时图片存放目录
         self.temp_dir = os.path.join(tempfile.gettempdir(), "linkview_images")
 
     async def initialize(self):
         """插件初始化，创建临时目录"""
         os.makedirs(self.temp_dir, exist_ok=True)
-        logger.info("LinkView 插件已加载！")
+        # 日志输出当前配置
+        enabled = self.config.get("enable", False)
+        whitelist = self.config.get("group_whitelist", [])
+        logger.info(f"LinkView 插件已加载！解析功能: {'开启' if enabled else '关闭'}，白名单群: {whitelist}")
+
+    def _is_allowed(self, event: AstrMessageEvent) -> bool:
+        """检查当前消息是否允许触发解析功能。
+        
+        逻辑：
+        1. 如果 enable=False，全局禁用（指令也不响应）
+        2. 如果 group_whitelist 为空列表，则所有群/私聊都允许
+        3. 如果 group_whitelist 非空，则只有白名单中的群聊允许（私聊也放行）
+        """
+        if not self.config.get("enable", False):
+            return False
+        
+        whitelist = self.config.get("group_whitelist", [])
+        if not whitelist:
+            # 白名单为空 = 不限制
+            return True
+        
+        group_id = event.get_group_id()
+        if not group_id:
+            # 私聊消息，放行
+            return True
+        
+        # 白名单中的值统一转为字符串比较
+        whitelist_str = [str(g) for g in whitelist]
+        return str(group_id) in whitelist_str
 
     # ========================
     #    工具方法
@@ -110,13 +139,14 @@ class LinkViewPlugin(Star):
             logger.error(f"种子搜索爬虫失败: {e}")
             return None
 
-    async def _do_parse_and_send(self, event: AstrMessageEvent, original_url: str):
-        """核心解析逻辑：调用 whatslink API 解析磁力链接，获取截图并发送
+    async def _do_parse(self, event: AstrMessageEvent, original_url: str) -> Tuple[Optional[list], str, List[str]]:
+        """核心解析逻辑：调用 whatslink API 解析磁力链接，获取截图并构建消息组件。
 
-        返回一个 MessageEventResult 列表（用于外部 yield）。
+        返回三元组 (chain_or_nodes, summary_text, temp_files)：
+        - chain_or_nodes: 构建好的消息组件列表（Node 列表或普通组件列表），None 表示无图可发
+        - summary_text: 汇总文本
+        - temp_files: 需要在发送完成后清理的临时文件路径列表
         """
-        results = []
-
         # 清理 URL（去掉 & 后面的参数）
         ampersand_index = original_url.find("&")
         cleaned_url = original_url[:ampersand_index] if ampersand_index != -1 else original_url
@@ -136,31 +166,30 @@ class LinkViewPlugin(Star):
                 data = response.json()
         except Exception as e:
             logger.error(f"调用链接解析API时出错: {e}")
-            results.append(event.plain_result("解析失败，请检查链接或稍后再试。"))
-            return results
+            return None, "解析失败，请检查链接或稍后再试。", []
 
         # 检查 API 错误
         api_error = data.get("error")
         if api_error:
-            results.append(event.plain_result(f"解析失败：API返回错误 - {api_error}"))
-            return results
+            return None, f"解析失败：API返回错误 - {api_error}", []
+
+        # 提取文件信息
+        file_name = data.get("name", "未知")
+        file_size = data.get("size", 0)
+        file_count = data.get("count", 0)
+        size_gb = file_size / (1024 * 1024 * 1024)
 
         # 获取截图列表
         screenshots = data.get("screenshots")
         total_found = len(screenshots) if isinstance(screenshots, list) else 0
 
         if not total_found:
-            file_name = data.get("name", "未知")
-            file_size = data.get("size", 0)
-            file_count = data.get("count", 0)
-            size_gb = file_size / (1024 * 1024 * 1024)
-            results.append(event.plain_result(
+            return None, (
                 f"文件名：{file_name}\n"
                 f"总大小：{size_gb:.2f} GB\n"
                 f"文件数：{file_count}\n"
                 f"但链接中未找到任何预览截图。"
-            ))
-            return results
+            ), []
 
         # 并发下载并加噪图片
         tasks = [
@@ -170,36 +199,78 @@ class LinkViewPlugin(Star):
         ]
         processed_images = await asyncio.gather(*tasks)
 
-        # 构建消息链：先发磁力链接文本，再逐张发图片
-        chain = [Comp.Plain(cleaned_url)]
+        # 收集成功处理的图片路径
         noise_added_count = 0
         temp_files = []
+        valid_images = []
 
         for img_path in processed_images:
             if img_path:
-                chain.append(Comp.Image.fromFileSystem(img_path))
+                valid_images.append(img_path)
                 temp_files.append(img_path)
                 noise_added_count += 1
 
-        if len(chain) > 1:
-            results.append(event.chain_result(chain))
+        if not valid_images:
+            return None, (
+                f"解析完成，链接共包含 {total_found} 张截图，但全部下载失败。"
+            ), []
 
-        # 汇总信息
-        summary_text = (
+        # 获取 bot 名称，用于合并转发消息的显示
+        bot_name = self.config.get("forward_bot_name", "LinkView")
+        bot_uin = int(self.config.get("forward_bot_uin", 0))
+        use_forward = self.config.get("use_forward_message", True)
+
+        if use_forward and event.get_group_id():
+            # 群聊 + 开启合并转发：构建 Nodes 容器
+            # 关键：必须用 Comp.Nodes 把所有 Node 包在一起，
+            # 否则框架会逐个 Node 调用 send_group_forward_msg，变成多条独立转发
+            node_list = []
+
+            # 第一条 Node：磁力链接 + 文件信息
+            info_text = (
+                f"🔗 {cleaned_url}\n\n"
+                f"📄 文件名：{file_name}\n"
+                f"📦 总大小：{size_gb:.2f} GB\n"
+                f"📁 文件数：{file_count}\n"
+                f"🖼️ 截图数：{total_found}"
+            )
+            node_list.append(Comp.Node(
+                uin=bot_uin,
+                name=bot_name,
+                content=[Comp.Plain(info_text)]
+            ))
+
+            # 每张截图作为一条 Node
+            for img_path in valid_images:
+                node_list.append(Comp.Node(
+                    uin=bot_uin,
+                    name=bot_name,
+                    content=[Comp.Image.fromFileSystem(img_path)]
+                ))
+
+            # 用 Nodes 容器包裹所有 Node，框架会一次性调用 send_group_forward_msg
+            chain = [Comp.Nodes(node_list)]
+        else:
+            # 私聊或关闭合并转发：普通消息链
+            chain = [Comp.Plain(cleaned_url)]
+            for img_path in valid_images:
+                chain.append(Comp.Image.fromFileSystem(img_path))
+
+        summary = (
             f"解析完成，链接共包含 {total_found} 张截图，"
             f"已成功发送 {noise_added_count} 张。\n"
             f"已成功对 {noise_added_count} 张图片加入噪音。"
         )
-        results.append(event.plain_result(summary_text))
 
-        # 清理临时文件
+        return chain, summary, temp_files
+
+    def _cleanup_temp_files(self, temp_files: List[str]):
+        """清理临时文件"""
         for f in temp_files:
             try:
                 os.remove(f)
             except OSError:
                 pass
-
-        return results
 
     # ========================
     #    指令 Handler
@@ -208,6 +279,9 @@ class LinkViewPlugin(Star):
     @filter.command("种子搜索")
     async def seed_search(self, event: AstrMessageEvent):
         """搜索关键词并解析第一条结果的磁力链接。用法：/种子搜索 关键词"""
+        if not self._is_allowed(event):
+            return  # 静默忽略，不响应
+        
         # 获取指令后面的参数文本
         search_term = event.message_str.strip()
         if not search_term:
@@ -222,21 +296,30 @@ class LinkViewPlugin(Star):
             return
 
         # 解析找到的磁力链接
-        results = await self._do_parse_and_send(event, magnet_link)
-        for result in results:
-            yield result
+        chain, summary, temp_files = await self._do_parse(event, magnet_link)
+        if chain:
+            # 用 chain_result 一次性发送所有 Node（合并转发为一条消息）
+            yield event.chain_result(chain)
+            self._cleanup_temp_files(temp_files)
+        yield event.plain_result(summary)
 
     @filter.regex(r"^magnet:\?xt=urn:[a-zA-Z0-9]+:[a-zA-Z0-9]+")
     async def magnet_auto_parse(self, event: AstrMessageEvent):
         """自动检测并解析消息中的磁力链接"""
+        if not self._is_allowed(event):
+            return  # 静默忽略，不响应
+        
         magnet_url = event.message_str.strip()
         logger.info(f"检测到磁力链接: {magnet_url[:60]}...")
 
         yield event.plain_result("收到，正在自动解析磁力链接...")
 
-        results = await self._do_parse_and_send(event, magnet_url)
-        for result in results:
-            yield result
+        chain, summary, temp_files = await self._do_parse(event, magnet_url)
+        if chain:
+            # 用 chain_result 一次性发送所有 Node（合并转发为一条消息）
+            yield event.chain_result(chain)
+            self._cleanup_temp_files(temp_files)
+        yield event.plain_result(summary)
 
     async def terminate(self):
         """插件销毁，清理临时目录"""
